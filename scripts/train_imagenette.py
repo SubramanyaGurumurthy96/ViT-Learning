@@ -12,7 +12,8 @@ from vit.data import load_imagenette
 from vit.utils import get_gradient_norm, validate
 
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
 
 def log_heatmap(writer, tag, data_2d, title, step):
@@ -53,7 +54,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoint-path",
         default=os.path.join(
-            PROJECT_ROOT, "checkpoints", "best_vit_imagenette.pth"
+            SCRIPT_DIR, "checkpoints", "best_vit_imagenette.pth"
         ),
     )
     parser.add_argument(
