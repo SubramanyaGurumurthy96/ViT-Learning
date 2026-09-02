@@ -2,3 +2,6 @@ checkpoints/*
 cifar-10-python/*
 imageNette/*
 runs/*
+PKG-INFO
+SOURCES.txt
+*.pyc
