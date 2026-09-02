@@ -1,0 +1,5 @@
+torch
+torchvision
+numpy
+matplotlib>=3.8
+tensorboard

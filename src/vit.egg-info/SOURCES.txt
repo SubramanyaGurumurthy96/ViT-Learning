@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+src/vit/__init__.py
+src/vit/attention.py
+src/vit/config.py
+src/vit/data.py
+src/vit/model.py
+src/vit/patch_embedding.py
+src/vit/transformer.py
+src/vit/utils.py
+src/vit.egg-info/PKG-INFO
+src/vit.egg-info/SOURCES.txt
+src/vit.egg-info/dependency_links.txt
+src/vit.egg-info/requires.txt
+src/vit.egg-info/top_level.txt

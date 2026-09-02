@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vit"
+version = "0.1.0"
+description = "Vision Transformer (ViT) for CIFAR-10"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy",
+    "matplotlib>=3.8",
+    "tensorboard",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
