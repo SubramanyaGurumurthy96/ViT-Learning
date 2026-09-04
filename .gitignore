@@ -5,3 +5,4 @@ runs/*
 PKG-INFO
 SOURCES.txt
 *.pyc
+oxford_data/*
