@@ -37,6 +37,10 @@ NUM_CLASSES = 10
 
 NUM_IMAGES_TO_SHOW = 9
 
+# Predictions with a confidence below this value are
+# additionally shown in a separate visualization.
+CONFIDENCE_THRESHOLD = 0.80
+
 # -----------------------------------------
 # Human-readable names for the Imagenette
 # WordNet-ID folders. ImageFolder assigns
@@ -77,7 +81,6 @@ def find_data_dir():
 
 def find_checkpoint():
     candidates = [
-        os.path.join(PROJECT_ROOT, "checkpoints", "best_vit_imagenette.pth"),
         os.path.join(SCRIPT_DIR, "checkpoints", "best_vit_imagenette.pth"),
     ]
 
@@ -160,6 +163,142 @@ def visualize(images, true_labels, pred_labels, confidences, names):
     plt.show()
 
 
+def visualize_low_confidence(
+    images, true_labels, pred_labels, confidences, names, threshold
+):
+    low_idx = [
+        i for i, conf in enumerate(confidences) if conf < threshold
+    ]
+
+    if not low_idx:
+        print(
+            f"No predictions below "
+            f"{threshold * 100:.0f}% confidence."
+        )
+        return
+
+    count = len(low_idx)
+    cols = min(3, count)
+    rows = (count + cols - 1) // cols
+
+    fig, axes = plt.subplots(
+        rows,
+        cols,
+        figsize=(3 * cols, 3 * rows),
+        squeeze=False,
+    )
+    axes = axes.flatten()
+
+    for position, idx in enumerate(low_idx):
+        ax = axes[position]
+
+        # image tensor is [C, H, W] in [0, 1]
+        image = images[idx].permute(1, 2, 0).cpu().numpy()
+
+        ax.imshow(image)
+        ax.axis("off")
+
+        true_name = names[true_labels[idx]]
+        pred_name = names[pred_labels[idx]]
+        correct = true_labels[idx] == pred_labels[idx]
+
+        color = "green" if correct else "red"
+
+        ax.set_title(
+            f"pred: {pred_name} ({confidences[idx] * 100:.1f}%)\n"
+            f"true: {true_name}",
+            color=color,
+            fontsize=10,
+        )
+
+    for j in range(count, len(axes)):
+        axes[j].axis("off")
+
+    fig.suptitle(
+        f"Low-confidence predictions (< {threshold * 100:.0f}%)",
+        fontsize=14,
+    )
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    output_path = os.path.join(
+        PROJECT_ROOT, "inference_low_confidence.png"
+    )
+    fig.savefig(output_path, dpi=120)
+
+    print(f"Saved low-confidence visualization to: {output_path}")
+
+    plt.show()
+
+
+def visualize_high_confidence(
+    images, true_labels, pred_labels, confidences, names, threshold
+):
+    high_idx = [
+        i for i, conf in enumerate(confidences) if conf >= threshold
+    ]
+
+    if not high_idx:
+        print(
+            f"No predictions at or above "
+            f"{threshold * 100:.0f}% confidence."
+        )
+        return
+
+    count = len(high_idx)
+    cols = min(3, count)
+    rows = (count + cols - 1) // cols
+
+    fig, axes = plt.subplots(
+        rows,
+        cols,
+        figsize=(3 * cols, 3 * rows),
+        squeeze=False,
+    )
+    axes = axes.flatten()
+
+    for position, idx in enumerate(high_idx):
+        ax = axes[position]
+
+        # image tensor is [C, H, W] in [0, 1]
+        image = images[idx].permute(1, 2, 0).cpu().numpy()
+
+        ax.imshow(image)
+        ax.axis("off")
+
+        true_name = names[true_labels[idx]]
+        pred_name = names[pred_labels[idx]]
+        correct = true_labels[idx] == pred_labels[idx]
+
+        color = "green" if correct else "red"
+
+        ax.set_title(
+            f"pred: {pred_name} ({confidences[idx] * 100:.1f}%)\n"
+            f"true: {true_name}",
+            color=color,
+            fontsize=10,
+        )
+
+    for j in range(count, len(axes)):
+        axes[j].axis("off")
+
+    fig.suptitle(
+        f"High-confidence predictions (>= {threshold * 100:.0f}%)",
+        fontsize=14,
+    )
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    output_path = os.path.join(
+        PROJECT_ROOT, "inference_high_confidence.png"
+    )
+    fig.savefig(output_path, dpi=120)
+
+    print(f"Saved high-confidence visualization to: {output_path}")
+
+    plt.show()
+
+
 def main():
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
@@ -238,6 +377,57 @@ def main():
         predictions.tolist(),
         confidences.tolist(),
         names,
+    )
+
+    # -----------------------------------------
+    # Extra: predictions the model was unsure
+    # about (confidence < CONFIDENCE_THRESHOLD)
+    # get their own separate visualization.
+    # -----------------------------------------
+
+    confidence_list = confidences.tolist()
+
+    low_conf_count = sum(
+        1 for conf in confidence_list if conf < CONFIDENCE_THRESHOLD
+    )
+
+    print(
+        f"{low_conf_count} of {len(confidence_list)} predictions "
+        f"below {CONFIDENCE_THRESHOLD * 100:.0f}% confidence."
+    )
+
+    visualize_low_confidence(
+        images,
+        labels.tolist(),
+        predictions.tolist(),
+        confidence_list,
+        names,
+        CONFIDENCE_THRESHOLD,
+    )
+
+    # -----------------------------------------
+    # Extra: the reverse case -- predictions the
+    # model was confident about (confidence >=
+    # CONFIDENCE_THRESHOLD) get their own
+    # separate visualization too.
+    # -----------------------------------------
+
+    high_conf_count = sum(
+        1 for conf in confidence_list if conf >= CONFIDENCE_THRESHOLD
+    )
+
+    print(
+        f"{high_conf_count} of {len(confidence_list)} predictions "
+        f"at or above {CONFIDENCE_THRESHOLD * 100:.0f}% confidence."
+    )
+
+    visualize_high_confidence(
+        images,
+        labels.tolist(),
+        predictions.tolist(),
+        confidence_list,
+        names,
+        CONFIDENCE_THRESHOLD,
     )
 
 

@@ -1,4 +1,5 @@
 import argparse
+from itertools import accumulate
 import os
 
 import matplotlib.pyplot as plt
@@ -46,8 +47,8 @@ def parse_args():
     )
     parser.add_argument("--image-size", type=int, default=160)
     parser.add_argument("--patch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -154,6 +155,8 @@ def main():
         capture_patch_embedding
     )
 
+    accumulatation_step = 2
+
     for epoch in range(args.epochs):
 
         # =====================================================
@@ -173,12 +176,6 @@ def main():
             # -----------------------------------------
 
             batch_images = batch_images.float()
-
-            # -----------------------------------------
-            # Clear previous gradients
-            # -----------------------------------------
-
-            optimizer.zero_grad(set_to_none=True)
 
             # -----------------------------------------
             # Forward pass
@@ -208,6 +205,8 @@ def main():
                 output,
                 batch_labels
             )
+
+            loss = loss / accumulatation_step
 
             # -----------------------------------------
             # Accuracy
@@ -249,7 +248,7 @@ def main():
             # Layer heatmap visualization
             # -----------------------------------------
 
-            if global_step % 100 == 0:
+            if global_step % 5 == 0:
 
                 # -----------------------------------------
                 # Patch embedding layer
@@ -404,14 +403,20 @@ def main():
             # -----------------------------------------
             # Update parameters
             # -----------------------------------------
+            if (batch_idx + 1) %accumulatation_step == 0:
+                optimizer.step()
 
-            optimizer.step()
+                # -----------------------------------------
+                # Clear previous gradients
+                # -----------------------------------------
+
+                optimizer.zero_grad(set_to_none=True)
 
             # -----------------------------------------
             # Terminal output
             # -----------------------------------------
 
-            if global_step % 100 == 0:
+            if global_step % 5 == 0:
 
                 print("############################")
                 print("epoch:", epoch)
