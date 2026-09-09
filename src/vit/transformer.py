@@ -26,7 +26,10 @@ class TransformerBlock(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(embedding_dim, mlp_dim),
             nn.GELU(),
-            nn.Linear(mlp_dim, embedding_dim)
+            nn.Dropout(0.1),
+
+            nn.Linear(mlp_dim, embedding_dim),
+            nn.Dropout(0.1)
         )
 
     def forward(self, x):

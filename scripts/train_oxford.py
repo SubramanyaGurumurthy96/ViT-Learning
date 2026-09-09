@@ -78,6 +78,7 @@ def validate(
     val_loader,
     classification_criterion,
     segmentation_criterion,
+    num_segments=3,
 ):
     # -----------------------------------------
     # Validation loop for the joint
@@ -86,6 +87,9 @@ def validate(
     # The model returns a tuple
     # (class_logits, seg_logits), so we can't
     # reuse vit.utils.validate here.
+    #
+    # The loss here MUST match the training
+    # objective: classification CE + (seg CE + Dice).
     # -----------------------------------------
 
     model.eval()
@@ -96,6 +100,14 @@ def validate(
 
     correct_pixels = 0
     total_pixels = 0
+
+    # Per-class accumulators for mean IoU and per-class Dice.
+    # Class ids (remapped trimap):
+    #   0 = foreground, 1 = background, 2 = boundary
+    intersection = torch.zeros(num_segments)
+    union = torch.zeros(num_segments)
+    pred_area = torch.zeros(num_segments)
+    target_area = torch.zeros(num_segments)
 
     with torch.no_grad():
 
@@ -110,12 +122,22 @@ def validate(
                 batch_labels
             )
 
-            # segmentation_loss = segmentation_criterion(
-            #     seg_logits,
-            #     batch_masks
-            # )
+            # Match the TRAINING objective exactly:
+            # segmentation = cross-entropy + Dice.
+            seg_ce_loss = segmentation_criterion(
+                seg_logits,
+                batch_masks
+            )
 
-            loss = classification_loss # + segmentation_loss
+            seg_dice_loss = dice_loss(
+                seg_logits,
+                batch_masks,
+                num_classes=num_segments
+            )
+
+            segmentation_loss = seg_ce_loss + seg_dice_loss
+
+            loss = classification_loss + segmentation_loss
 
             predictions = class_logits.argmax(dim=1)
 
@@ -136,13 +158,42 @@ def validate(
 
             total_pixels += batch_masks.numel()
 
+            # per-class IoU / Dice accumulation
+            for c in range(num_segments):
+                pred_c = (seg_predictions == c)
+                target_c = (batch_masks == c)
+
+                intersection[c] += (pred_c & target_c).sum().item()
+                union[c] += (pred_c | target_c).sum().item()
+                pred_area[c] += pred_c.sum().item()
+                target_area[c] += target_c.sum().item()
+
     avg_loss = total_loss / total_samples
 
     accuracy = total_correct / total_samples
 
     seg_accuracy = correct_pixels / total_pixels
 
-    return avg_loss, accuracy, seg_accuracy
+    eps = 1e-6
+
+    per_class_iou = (
+        intersection / (union + eps)
+    ).tolist()
+
+    mean_iou = sum(per_class_iou) / num_segments
+
+    per_class_dice = (
+        (2.0 * intersection) / (pred_area + target_area + eps)
+    ).tolist()
+
+    return (
+        avg_loss,
+        accuracy,
+        seg_accuracy,
+        mean_iou,
+        per_class_iou,
+        per_class_dice,
+    )
 
 
 def parse_args():
@@ -158,9 +209,9 @@ def parse_args():
     parser.add_argument("--image-size", type=int, default=160)
     parser.add_argument("--patch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
         "--checkpoint-path",
@@ -192,6 +243,18 @@ def main():
         args.data_dir,
         image_size=args.image_size
     )
+
+    # -----------------------------------------
+    # Stronger training-time augmentation.
+    #
+    # Crop + horizontal flip are applied with the
+    # SAME random parameters to both the image and
+    # its segmentation mask (handled inside the
+    # dataset), so they stay spatially aligned.
+    # Color jitter is photometric and image-only.
+    # -----------------------------------------
+
+    train_dataset.augment = True
 
     loader = DataLoader(
         train_dataset,
@@ -231,6 +294,11 @@ def main():
         weight_decay=args.weight_decay
     )
 
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs
+    )
+
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(
             checkpoint_path,
@@ -261,21 +329,6 @@ def main():
     writer = SummaryWriter(args.runs_dir)
 
     attention_grid = args.image_size // args.patch_size
-
-    # -----------------------------------------
-    # Capture patch-embedding layer output for
-    # visualization via a forward hook. Stores
-    # the tensor of shape [B, num_patches + 1, embedding_dim].
-    # -----------------------------------------
-
-    patch_activation = {}
-
-    def capture_patch_embedding(module, inputs, output):
-        patch_activation["output"] = output.detach()
-
-    model.patch_embedding.register_forward_hook(
-        capture_patch_embedding
-    )
 
     accumulatation_step = 2
 
@@ -334,16 +387,16 @@ def main():
                 batch_labels
             )
 
-            # seg_dice_loss = dice_loss(seg_logits, batch_masks, num_classes=3)
+            seg_dice_loss = dice_loss(seg_logits, batch_masks, num_classes=3)
 
-            # seg_ce_loss = segmentation_criterion(
-            #     seg_logits,
-            #     batch_masks
-            # )
+            seg_ce_loss = segmentation_criterion(
+                seg_logits,
+                batch_masks
+            )
 
-            # segmentation_loss = seg_ce_loss + seg_dice_loss
-            # loss = classification_loss + segmentation_loss
-            loss = classification_loss 
+            segmentation_loss = seg_ce_loss + seg_dice_loss
+            loss = classification_loss + segmentation_loss
+            # loss = classification_loss 
 
             loss = loss / accumulatation_step
 
@@ -383,11 +436,11 @@ def main():
                 global_step
             )
 
-            # writer.add_scalar(
-            #     "training/segmentation_loss",
-            #     segmentation_loss.item(),
-            #     global_step
-            # )
+            writer.add_scalar(
+                "training/segmentation_loss",
+                segmentation_loss.item(),
+                global_step
+            )
 
             writer.add_scalar(
                 "training/accuracy",
@@ -400,48 +453,6 @@ def main():
             # -----------------------------------------
 
             if global_step % 5 == 0:
-
-                # -----------------------------------------
-                # Patch embedding layer
-                #
-                # patch_activation["output"]:
-                # [B, num_patches + 1, embedding_dim]
-                # -----------------------------------------
-
-                patch_output = patch_activation.get("output")
-
-                if patch_output is not None:
-
-                    # First image, drop the CLS token
-                    # [num_patches, embedding_dim]
-                    patch_tokens = patch_output[0, 1:, :]
-
-                    # Per-patch embedding magnitude,
-                    # laid back out on the patch grid
-                    patch_norms = patch_tokens.norm(
-                        dim=1
-                    ).reshape(
-                        attention_grid,
-                        attention_grid
-                    )
-
-                    log_heatmap(
-                        writer,
-                        "patch_embedding/token_norms",
-                        patch_norms,
-                        f"Epoch {epoch} - Patch Norms",
-                        global_step
-                    )
-
-                    # Full token-by-dimension embedding map
-                    # [num_patches, embedding_dim]
-                    log_heatmap(
-                        writer,
-                        "patch_embedding/embeddings",
-                        patch_tokens,
-                        f"Epoch {epoch} - Patch Embeddings",
-                        global_step
-                    )
 
                 # -----------------------------------------
                 # Segmentation visualization
@@ -483,7 +494,6 @@ def main():
 
                     # First image, CLS -> image patches
                     for head_idx in range(num_heads):
-
                         cls_attention = attention[
                             0,
                             head_idx,
@@ -549,10 +559,26 @@ def main():
             )
 
             writer.add_scalar(
-                "gradients/patch_embedding",
-                get_gradient_norm(
-                    model.patch_embedding.parameters()
-                ),
+                "gradients/enc1",
+                get_gradient_norm(model.enc1.parameters()),
+                global_step
+            )
+
+            writer.add_scalar(
+                "gradients/enc2",
+                get_gradient_norm(model.enc2.parameters()),
+                global_step
+            )
+
+            writer.add_scalar(
+                "gradients/enc3",
+                get_gradient_norm(model.enc3.parameters()),
+                global_step
+            )
+
+            writer.add_scalar(
+                "gradients/enc4",
+                get_gradient_norm(model.enc4.parameters()),
                 global_step
             )
 
@@ -614,10 +640,10 @@ def main():
                     classification_loss.item()
                 )
 
-                # print(
-                #     "segmentation loss:",
-                #     segmentation_loss.item()
-                # )
+                print(
+                    "segmentation loss:",
+                    segmentation_loss.item()
+                )
 
                 print(
                     "batch accuracy:",
@@ -650,12 +676,21 @@ def main():
         # VALIDATION
         # =====================================================
 
-        val_loss, val_accuracy, val_seg_accuracy = validate(
+        (
+            val_loss,
+            val_accuracy,
+            val_seg_accuracy,
+            val_mean_iou,
+            val_per_class_iou,
+            val_per_class_dice,
+        ) = validate(
             model,
             val_loader,
             classification_criterion,
             segmentation_criterion,
         )
+
+        seg_class_names = ["foreground", "background", "boundary"]
 
         # -----------------------------------------
         # TensorBoard epoch metrics
@@ -691,6 +726,24 @@ def main():
             epoch
         )
 
+        writer.add_scalar(
+            "validation/mean_iou",
+            val_mean_iou,
+            epoch
+        )
+
+        for c, cname in enumerate(seg_class_names):
+            writer.add_scalar(
+                f"validation/iou_{cname}",
+                val_per_class_iou[c],
+                epoch
+            )
+            writer.add_scalar(
+                f"validation/dice_{cname}",
+                val_per_class_dice[c],
+                epoch
+            )
+
         print("")
         print("================================")
         print(f"Epoch {epoch}")
@@ -714,6 +767,22 @@ def main():
         print(
             f"Val Seg Acc:    "
             f"{val_seg_accuracy:.4f}"
+        )
+        print(
+            f"Val Mean IoU:   "
+            f"{val_mean_iou:.4f}"
+        )
+        print(
+            f"Per-class IoU:  "
+            f"fg={val_per_class_iou[0]:.4f}  "
+            f"bg={val_per_class_iou[1]:.4f}  "
+            f"boundary={val_per_class_iou[2]:.4f}"
+        )
+        print(
+            f"Per-class Dice: "
+            f"fg={val_per_class_dice[0]:.4f}  "
+            f"bg={val_per_class_dice[1]:.4f}  "
+            f"boundary={val_per_class_dice[2]:.4f}"
         )
         print("================================")
 
@@ -789,7 +858,16 @@ def main():
             print("******************************")
             print("")
 
+        writer.add_scalar(
+            "epoch/learning_rate",
+            optimizer.param_groups[0]["lr"],
+            epoch
+        )
+
         writer.flush()
+
+        # step the cosine LR schedule once per epoch
+        scheduler.step()
 
     writer.close()
 

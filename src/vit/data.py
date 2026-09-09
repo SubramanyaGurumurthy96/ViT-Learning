@@ -1,8 +1,10 @@
 import os
 import pickle
+import random
 
 import numpy as np
 import torch
+import torchvision.transforms.functional as TF
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
@@ -78,6 +80,20 @@ class OxfordPetDataset(Dataset):
         self.image_size = image_size
         self.remap_mask = remap_mask
 
+        # When True, apply synchronized geometric
+        # augmentation (random resized crop + horizontal
+        # flip) using the SAME random parameters for the
+        # image and its mask, plus image-only color jitter.
+        # See __getitem__ for details.
+        self.augment = False
+        self.scale = (0.7, 1.0)
+        self.ratio = (3.0 / 4.0, 4.0 / 3.0)
+        self.color_jitter = transforms.ColorJitter(
+            brightness=0.2,
+            contrast=0.2,
+            saturation=0.2,
+        )
+
         self.image_tf = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
@@ -92,17 +108,58 @@ class OxfordPetDataset(Dataset):
         image_path = os.path.join(self.images_dir, name + ".jpg")
         mask_path = os.path.join(self.trimaps_dir, name + ".png")
 
-        # ----- input image -----
         image = Image.open(image_path).convert("RGB")
-        image = self.image_tf(image)
+        mask = Image.open(mask_path)
 
-        # ----- segmentation trimap -----
-        # Nearest-neighbour resize so the integer class
-        # values in the trimap are preserved.
-        mask = Image.open(mask_path).resize(
-            (self.image_size, self.image_size),
-            Image.NEAREST,
-        )
+        if self.augment:
+            # -----------------------------------------
+            # Synchronized geometric augmentation.
+            #
+            # The SAME random crop box and flip decision
+            # are applied to both the image and the mask
+            # so they stay pixel-aligned (critical for
+            # learning sharp boundaries). The image uses
+            # bilinear resampling; the mask uses nearest
+            # so its integer class ids are preserved.
+            # -----------------------------------------
+
+            i, j, h, w = transforms.RandomResizedCrop.get_params(
+                image,
+                scale=self.scale,
+                ratio=self.ratio,
+            )
+
+            image = TF.resized_crop(
+                image, i, j, h, w,
+                [self.image_size, self.image_size],
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            )
+            mask = TF.resized_crop(
+                mask, i, j, h, w,
+                [self.image_size, self.image_size],
+                interpolation=transforms.InterpolationMode.NEAREST,
+            )
+
+            if random.random() < 0.5:
+                image = TF.hflip(image)
+                mask = TF.hflip(mask)
+
+            # Color jitter is photometric -> image only.
+            image = self.color_jitter(image)
+
+            image = TF.to_tensor(image)
+        else:
+            # ----- input image -----
+            image = self.image_tf(image)
+
+            # ----- segmentation trimap -----
+            # Nearest-neighbour resize so the integer class
+            # values in the trimap are preserved.
+            mask = mask.resize(
+                (self.image_size, self.image_size),
+                Image.NEAREST,
+            )
+
         mask = torch.from_numpy(np.array(mask, dtype=np.int64))
 
         if self.remap_mask:
