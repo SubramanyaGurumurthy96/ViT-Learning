@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 
 import matplotlib.pyplot as plt
@@ -10,7 +11,13 @@ from torch.utils.tensorboard import SummaryWriter
 
 from vit import ViT
 from vit.data import load_oxford_pets
-from vit.utils import get_gradient_norm
+from vit.utils import (
+    find_nonfinite_gradients,
+    get_gradient_norm,
+    optimizer_state_is_finite,
+    resolve_device,
+    state_dict_is_finite,
+)
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -79,6 +86,7 @@ def validate(
     classification_criterion,
     segmentation_criterion,
     num_segments=3,
+    device=None,
 ):
     # -----------------------------------------
     # Validation loop for the joint
@@ -114,6 +122,11 @@ def validate(
         for batch_images, batch_labels, batch_masks in val_loader:
 
             batch_images = batch_images.float()
+
+            if device is not None:
+                batch_images = batch_images.to(device, non_blocking=True)
+                batch_labels = batch_labels.to(device, non_blocking=True)
+                batch_masks = batch_masks.to(device, non_blocking=True)
 
             class_logits, seg_logits = model(batch_images)
 
@@ -208,8 +221,8 @@ def parse_args():
     )
     parser.add_argument("--image-size", type=int, default=160)
     parser.add_argument("--patch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -223,6 +236,27 @@ def parse_args():
         "--runs-dir",
         default=os.path.join(PROJECT_ROOT, "runs", "vit_oxford"),
     )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="'auto' (CUDA when available), 'cuda', 'cuda:1', 'cpu', ...",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Load --checkpoint-path before training. OFF by default: "
+        "a checkpoint saved from a diverged run carries NaN weights "
+        "and NaN AdamW moments, and resuming from it poisons the new "
+        "run at step 0. Only a verifiably finite checkpoint is "
+        "accepted.",
+    )
+    parser.add_argument(
+        "--grad-norm-warn",
+        type=float,
+        default=1e4,
+        help="Print a warning when the global gradient norm exceeds "
+        "this. Diagnostic only - nothing is clipped or rescaled.",
+    )
     return parser.parse_args()
 
 
@@ -235,6 +269,24 @@ def main():
     )
 
     checkpoint_path = args.checkpoint_path
+
+    # -----------------------------------------
+    # Device
+    #
+    # Everything - model and every batch - has
+    # to be moved explicitly, otherwise the run
+    # silently stays on the CPU.
+    # -----------------------------------------
+
+    device = resolve_device(args.device)
+
+    print(f"device: {device}")
+
+    if device.type == "cuda":
+        print(f"gpu: {torch.cuda.get_device_name(device)}")
+        print(f"cuda devices visible: {torch.cuda.device_count()}")
+    elif args.device == "auto":
+        print("cuda not available - running on CPU")
 
     best_val_accuracy = 0.0
     best_val_loss = float("inf")
@@ -256,12 +308,14 @@ def main():
 
     train_dataset.augment = True
 
+    pin_memory = device.type == "cuda"
+
     loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         shuffle=True,
-        pin_memory=False
+        pin_memory=pin_memory
     )
 
     val_loader = DataLoader(
@@ -269,7 +323,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=False
+        pin_memory=pin_memory
     )
 
     # -----------------------------------------
@@ -288,6 +342,8 @@ def main():
         num_segments=3
     )
 
+    model = model.to(device)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -299,11 +355,52 @@ def main():
         T_max=args.epochs
     )
 
-    if os.path.exists(checkpoint_path):
+    # -----------------------------------------
+    # Resume - opt-in, and validated.
+    #
+    # This used to load unconditionally whenever
+    # the file existed. A diverged run had
+    # already written a checkpoint whose weights
+    # AND AdamW moments were NaN, so every later
+    # run silently started from NaN and could
+    # never recover. Restoring the weights alone
+    # would not be enough either: a NaN exp_avg_sq
+    # re-poisons the first step.
+    # -----------------------------------------
+
+    if not args.resume:
+        if os.path.exists(checkpoint_path):
+            print(
+                f"not resuming (pass --resume to load "
+                f"{checkpoint_path})"
+            )
+    elif not os.path.exists(checkpoint_path):
+        print(
+            f"--resume given but no checkpoint at {checkpoint_path} "
+            f"- starting from scratch"
+        )
+    else:
         checkpoint = torch.load(
             checkpoint_path,
-            map_location="cpu"
+            map_location=device
         )
+
+        model_ok, bad_param = state_dict_is_finite(
+            checkpoint["model_state_dict"]
+        )
+
+        optim_ok, bad_moment = optimizer_state_is_finite(
+            checkpoint["optimizer_state_dict"]
+        )
+
+        if not model_ok or not optim_ok:
+            raise RuntimeError(
+                f"Refusing to resume from {checkpoint_path}: it "
+                f"contains non-finite values "
+                f"(model: {bad_param}, optimizer: {bad_moment}). "
+                f"This checkpoint came from a diverged run - delete "
+                f"it or train without --resume."
+            )
 
         model.load_state_dict(
             checkpoint["model_state_dict"]
@@ -313,7 +410,10 @@ def main():
             checkpoint["optimizer_state_dict"]
         )
 
-        print("Checkpoint loaded")
+        print(
+            f"Checkpoint loaded (epoch {checkpoint.get('epoch')}, "
+            f"val_accuracy {checkpoint.get('val_accuracy')})"
+        )
 
     # -----------------------------------------
     # Two objectives: breed classification and
@@ -330,7 +430,11 @@ def main():
 
     attention_grid = args.image_size // args.patch_size
 
-    accumulatation_step = 2
+    accumulatation_step = 1
+
+    # Set when a non-finite loss or gradient is seen, so the run
+    # stops instead of writing the corruption into the weights.
+    stop_reason = None
 
     for epoch in range(args.epochs):
 
@@ -354,7 +458,17 @@ def main():
             # Prepare input
             # -----------------------------------------
 
-            batch_images = batch_images.float()
+            batch_images = batch_images.float().to(
+                device, non_blocking=pin_memory
+            )
+
+            batch_labels = batch_labels.to(
+                device, non_blocking=pin_memory
+            )
+
+            batch_masks = batch_masks.to(
+                device, non_blocking=pin_memory
+            )
 
             # -----------------------------------------
             # Forward pass
@@ -399,6 +513,28 @@ def main():
             # loss = classification_loss 
 
             loss = loss / accumulatation_step
+
+            # -----------------------------------------
+            # Fail fast on a non-finite loss.
+            #
+            # Checked BEFORE backward/step: once a nan
+            # reaches the optimizer the weights are
+            # unrecoverable, and every metric printed
+            # afterwards is an artifact (argmax over
+            # all-nan logits just returns index 0).
+            # -----------------------------------------
+
+            if not math.isfinite(loss.item()):
+                stop_reason = (
+                    f"non-finite loss at epoch {epoch}, "
+                    f"step {global_step}: "
+                    f"total={loss.item()} "
+                    f"classification={classification_loss.item()} "
+                    f"segmentation={segmentation_loss.item()} "
+                    f"(seg_ce={seg_ce_loss.item()} "
+                    f"seg_dice={seg_dice_loss.item()})"
+                )
+                break
 
             # -----------------------------------------
             # Accuracy
@@ -558,6 +694,48 @@ def main():
                 global_step
             )
 
+            # -----------------------------------------
+            # Fail fast on a non-finite gradient.
+            #
+            # get_gradient_norm accumulates in float64,
+            # so - unlike an fp32 reduction, which
+            # saturates at ~3.4e38 and reports inf for
+            # merely enormous gradients - a non-finite
+            # value here means real inf/nan elements.
+            # find_nonfinite_gradients then names them.
+            #
+            # Nothing is clipped: the point is to stop
+            # with the evidence intact, not to paper
+            # over the divergence.
+            # -----------------------------------------
+
+            if not math.isfinite(total_grad_norm):
+                offenders = find_nonfinite_gradients(
+                    model.named_parameters()
+                )
+
+                detail = ", ".join(
+                    f"{name} ({count}/{numel} non-finite)"
+                    for name, count, numel in offenders[:10]
+                ) or "none found - check the norm itself"
+
+                stop_reason = (
+                    f"non-finite gradient at epoch {epoch}, "
+                    f"step {global_step}: "
+                    f"float64 grad norm={total_grad_norm}; "
+                    f"{len(offenders)} parameter tensor(s) affected: "
+                    f"{detail}"
+                )
+                break
+
+            if total_grad_norm > args.grad_norm_warn:
+                print(
+                    f"WARNING step {global_step}: gradient norm "
+                    f"{total_grad_norm:.3e} exceeds "
+                    f"{args.grad_norm_warn:.3e} - gradients are "
+                    f"exploding even though the loss is still finite"
+                )
+
             writer.add_scalar(
                 "gradients/enc1",
                 get_gradient_norm(model.enc1.parameters()),
@@ -660,6 +838,9 @@ def main():
 
             global_step += 1
 
+        if stop_reason is not None:
+            break
+
         # =====================================================
         # TRAINING EPOCH STATISTICS
         # =====================================================
@@ -688,6 +869,7 @@ def main():
             val_loader,
             classification_criterion,
             segmentation_criterion,
+            device=device,
         )
 
         seg_class_names = ["foreground", "background", "boundary"]
@@ -792,6 +974,50 @@ def main():
 
         improved = False
 
+        # -----------------------------------------
+        # A diverged epoch must never be saved.
+        #
+        # best_val_accuracy starts at 0.0, so the
+        # chance-level accuracy of a fully-NaN model
+        # (1/37 = 0.027 > 0.0) counted as "improved"
+        # and overwrote the checkpoint with NaN
+        # weights - which the next run then loaded.
+        # Accuracy alone cannot detect this; the
+        # loss and the weights have to be checked.
+        # -----------------------------------------
+
+        metrics_finite = (
+            math.isfinite(val_loss)
+            and math.isfinite(val_accuracy)
+            and math.isfinite(train_epoch_loss)
+        )
+
+        weights_finite, bad_param = state_dict_is_finite(
+            model.state_dict()
+        )
+
+        if not metrics_finite or not weights_finite:
+            print("")
+            print("!!!!! CHECKPOINT SKIPPED !!!!!")
+            print(
+                f"Epoch {epoch} produced non-finite values "
+                f"(val_loss={val_loss}, "
+                f"val_accuracy={val_accuracy}, "
+                f"first non-finite parameter={bad_param}). "
+                f"Not saving - this model is unrecoverable and "
+                f"saving it would poison the next run."
+            )
+            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            print("")
+
+            stop_reason = (
+                f"non-finite validation at epoch {epoch}: "
+                f"val_loss={val_loss}, "
+                f"first non-finite parameter={bad_param}"
+            )
+
+            break
+
         # Primary metric = validation accuracy
         if val_accuracy > best_val_accuracy:
 
@@ -869,7 +1095,23 @@ def main():
         # step the cosine LR schedule once per epoch
         scheduler.step()
 
+    writer.flush()
     writer.close()
+
+    if stop_reason is not None:
+        print("")
+        print("==================================================")
+        print("TRAINING STOPPED - NON-FINITE VALUE DETECTED")
+        print("--------------------------------------------------")
+        print(stop_reason)
+        print("--------------------------------------------------")
+        print(
+            "No checkpoint was written for this state. To find "
+            "which tensor blows up first, run:"
+        )
+        print("    python3 diagnose_oxford.py")
+        print("==================================================")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
