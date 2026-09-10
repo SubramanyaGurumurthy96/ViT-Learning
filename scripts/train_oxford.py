@@ -61,6 +61,75 @@ def dice_loss(logits, targets, num_classes=3, eps=1e-6):
     return 1 - dice.mean()
 
 
+def mixup_batch(images, alpha):
+    # -----------------------------------------
+    # Mixup (Zhang et al., 2018).
+    #
+    # The batch is blended with a shuffled copy of
+    # itself under a single lambda drawn from
+    # Beta(alpha, alpha) - one lambda per batch, as
+    # in the paper, not one per sample.
+    #
+    # Only the INPUT is mixed here. The two target
+    # sets are combined in the loss (see mix_loss),
+    # which is what makes mixup a regularizer
+    # rather than a relabelling scheme.
+    # -----------------------------------------
+
+    lam = float(
+        torch.distributions.Beta(alpha, alpha).sample()
+    )
+
+    index = torch.randperm(
+        images.size(0),
+        device=images.device
+    )
+
+    mixed_images = (
+        lam * images + (1.0 - lam) * images[index]
+    )
+
+    return mixed_images, index, lam
+
+
+def mix_loss(loss_fn, outputs, target_a, target_b, lam):
+    # -----------------------------------------
+    # lambda-weighted loss against both target sets.
+    #
+    # Works for any loss taking (outputs, hard
+    # targets): the classification CE, the
+    # segmentation CE, and the soft Dice above.
+    #
+    # At lam == 1.0 (mixup off for this batch) it
+    # collapses to the original single-target loss,
+    # so a disabled-mixup run is bit-for-bit the
+    # old objective and costs nothing extra.
+    # -----------------------------------------
+
+    if lam >= 1.0:
+        return loss_fn(outputs, target_a)
+
+    return (
+        lam * loss_fn(outputs, target_a)
+        + (1.0 - lam) * loss_fn(outputs, target_b)
+    )
+
+
+def cosine_lr_at(base_lr, eta_min, epoch, t_max):
+    # -----------------------------------------
+    # Closed form of CosineAnnealingLR, used to
+    # re-synchronise the optimizer's LR after a
+    # resume. Stepping the scheduler forward in a
+    # loop would also work, but every step writes
+    # into optimizer.param_groups, so the closed
+    # form is both cheaper and easier to verify.
+    # -----------------------------------------
+
+    return eta_min + (base_lr - eta_min) * (
+        1.0 + math.cos(math.pi * epoch / t_max)
+    ) / 2.0
+
+
 def log_heatmap(writer, tag, data_2d, title, step):
     fig, ax = plt.subplots(figsize=(4, 4))
 
@@ -221,7 +290,7 @@ def parse_args():
     )
     parser.add_argument("--image-size", type=int, default=160)
     parser.add_argument("--patch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
@@ -249,6 +318,23 @@ def parse_args():
         "and NaN AdamW moments, and resuming from it poisons the new "
         "run at step 0. Only a verifiably finite checkpoint is "
         "accepted.",
+    )
+    parser.add_argument(
+        "--mixup-alpha",
+        type=float,
+        default=0.4,
+        help="Beta(alpha, alpha) parameter for Mixup. 0 disables it "
+        "and restores the previous objective exactly. Larger = more "
+        "mixing = stronger regularization; 0.2 is a gentle start, "
+        "0.4-0.8 is the next dial to turn.",
+    )
+    parser.add_argument(
+        "--mixup-prob",
+        type=float,
+        default=0.4,
+        help="Fraction of training batches that get mixed. Lower it "
+        "(e.g. 0.5) to leave a share of batches un-mixed, which also "
+        "gives the segmentation head clean supervision on those steps.",
     )
     parser.add_argument(
         "--grad-norm-warn",
@@ -366,7 +452,20 @@ def main():
     # never recover. Restoring the weights alone
     # would not be enough either: a NaN exp_avg_sq
     # re-poisons the first step.
+    #
+    # A resume also has to restore the *schedule*,
+    # not just the tensors. Previously it did not,
+    # with three consequences visible in the last
+    # run's log: epoch 90 of a cosine schedule
+    # restarted at the full base LR, the epoch
+    # counter restarted at 0, and best_val_accuracy
+    # restarted at 0.0 - so the very first epoch
+    # after the resume (0.5072) overwrote a better
+    # checkpoint (0.5129).
     # -----------------------------------------
+
+    start_epoch = 0
+    global_step = 0
 
     if not args.resume:
         if os.path.exists(checkpoint_path):
@@ -410,10 +509,119 @@ def main():
             checkpoint["optimizer_state_dict"]
         )
 
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        global_step = int(checkpoint.get("global_step", 0))
+
+        # The checkpoint is only ever written on an improvement, so
+        # its metrics ARE the best so far. Carrying them over is what
+        # stops the first resumed epoch from clobbering a better model.
+
+        best_val_accuracy = float(
+            checkpoint.get("val_accuracy", 0.0)
+        )
+
+        best_val_loss = float(
+            checkpoint.get("val_loss", float("inf"))
+        )
+
+        # -----------------------------------------
+        # Scheduler
+        # -----------------------------------------
+
+        scheduler_state = checkpoint.get("scheduler_state_dict")
+
+        if scheduler_state is not None:
+            scheduler.load_state_dict(scheduler_state)
+        else:
+            print(
+                "checkpoint carries no scheduler state (written before "
+                "scheduler resume existed) - rebuilding the cosine "
+                "position from the saved epoch instead"
+            )
+
+        # --epochs and --lr describe THIS run, and the loop below runs
+        # range(start_epoch, args.epochs), so the cosine horizon has to
+        # agree with them. load_state_dict() restored the SAVED T_max
+        # and base_lrs, which would otherwise silently outrank the flags.
+
+        if scheduler.T_max != args.epochs:
+            print(
+                f"cosine T_max {scheduler.T_max} -> {args.epochs} "
+                f"(from --epochs)"
+            )
+
+            scheduler.T_max = args.epochs
+
+        if any(base_lr != args.lr for base_lr in scheduler.base_lrs):
+            print(
+                f"cosine base LR {scheduler.base_lrs} -> {args.lr} "
+                f"(from --lr)"
+            )
+
+            scheduler.base_lrs = [
+                args.lr for _ in optimizer.param_groups
+            ]
+
+        # Same story for weight decay, which came back inside the
+        # optimizer's param_groups.
+
+        for group in optimizer.param_groups:
+            if group["weight_decay"] != args.weight_decay:
+                print(
+                    f"weight decay {group['weight_decay']} -> "
+                    f"{args.weight_decay} (from --weight-decay)"
+                )
+
+            group["weight_decay"] = args.weight_decay
+
+        # The saved position is "partway through epoch <saved epoch>",
+        # because the checkpoint is written before scheduler.step().
+        # Training resumes one epoch later, so move the curve to where
+        # that step() would have left it and push the LR into the
+        # optimizer now - otherwise the resumed epoch trains at the
+        # previous epoch's learning rate.
+
+        scheduler.last_epoch = start_epoch
+        scheduler._step_count = start_epoch + 1
+
+        resumed_lrs = [
+            cosine_lr_at(
+                base_lr,
+                scheduler.eta_min,
+                scheduler.last_epoch,
+                scheduler.T_max
+            )
+            for base_lr in scheduler.base_lrs
+        ]
+
+        for group, group_lr in zip(optimizer.param_groups, resumed_lrs):
+            group["lr"] = group_lr
+
+        scheduler._last_lr = resumed_lrs
+
         print(
             f"Checkpoint loaded (epoch {checkpoint.get('epoch')}, "
             f"val_accuracy {checkpoint.get('val_accuracy')})"
         )
+
+        print(
+            f"resuming at epoch {start_epoch}/{args.epochs}, "
+            f"global_step {global_step}, lr {resumed_lrs[0]:.6g}"
+        )
+
+        print(
+            f"best so far: val_accuracy {best_val_accuracy:.4f}, "
+            f"val_loss {best_val_loss:.4f}"
+        )
+
+    if start_epoch >= args.epochs:
+        print(
+            f"nothing to do: the checkpoint already finished epoch "
+            f"{start_epoch - 1} and --epochs is {args.epochs}. Raise "
+            f"--epochs to keep training."
+        )
+
+        return
 
     # -----------------------------------------
     # Two objectives: breed classification and
@@ -425,7 +633,28 @@ def main():
 
     print_once = False
 
-    global_step = 0
+    # -----------------------------------------
+    # Mixup - the new regularizer for this run.
+    #
+    # Classification is what is overfitting
+    # (train ~0.99 vs val ~0.51 for 90 epochs
+    # straight), so that is what gets mixed.
+    # -----------------------------------------
+
+    mixup_enabled = args.mixup_alpha > 0.0
+
+    if mixup_enabled:
+        print(
+            f"mixup: alpha={args.mixup_alpha}, prob={args.mixup_prob}"
+        )
+        print(
+            "note: train accuracy below is mixup-weighted, so it "
+            "reads much lower than an un-mixed run - expected, not a "
+            "regression. Compare validation accuracy across runs."
+        )
+    else:
+        print("mixup: disabled (--mixup-alpha 0)")
+
     writer = SummaryWriter(args.runs_dir)
 
     attention_grid = args.image_size // args.patch_size
@@ -436,7 +665,7 @@ def main():
     # stops instead of writing the corruption into the weights.
     stop_reason = None
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
 
         # =====================================================
         # TRAINING
@@ -445,7 +674,7 @@ def main():
         model.train()
 
         train_loss_sum = 0.0
-        train_correct = 0
+        train_correct = 0.0
         train_samples = 0
 
         for batch_idx, (
@@ -471,10 +700,46 @@ def main():
             )
 
             # -----------------------------------------
+            # Mixup
+            #
+            # The batch is blended with a shuffled
+            # copy of itself, and BOTH label sets are
+            # kept so the losses below can weight them
+            # by lambda.
+            #
+            # The segmentation objective is unchanged
+            # in form - still CE + Dice - but it sees
+            # the same mixed pixels, so its two mask
+            # sets get blended with the same lambda.
+            # Supervising it with mask A alone would
+            # ask the head to predict A from a picture
+            # that is only partly A. Turn --mixup-prob
+            # down to leave some batches un-mixed.
+            # -----------------------------------------
+
+            if (
+                mixup_enabled
+                and torch.rand(1).item() < args.mixup_prob
+            ):
+                model_input, mix_index, lam = mixup_batch(
+                    batch_images,
+                    args.mixup_alpha
+                )
+
+                labels_b = batch_labels[mix_index]
+                masks_b = batch_masks[mix_index]
+            else:
+                model_input = batch_images
+                lam = 1.0
+
+                labels_b = batch_labels
+                masks_b = batch_masks
+
+            # -----------------------------------------
             # Forward pass
             # -----------------------------------------
 
-            class_logits, seg_logits = model(batch_images)
+            class_logits, seg_logits = model(model_input)
 
             predictions = class_logits.argmax(dim=1)
 
@@ -496,16 +761,32 @@ def main():
             # Loss (classification + segmentation)
             # -----------------------------------------
 
-            classification_loss = classification_criterion(
+            classification_loss = mix_loss(
+                classification_criterion,
                 class_logits,
-                batch_labels
+                batch_labels,
+                labels_b,
+                lam
             )
 
-            seg_dice_loss = dice_loss(seg_logits, batch_masks, num_classes=3)
-
-            seg_ce_loss = segmentation_criterion(
+            seg_dice_loss = mix_loss(
+                lambda outputs, targets: dice_loss(
+                    outputs,
+                    targets,
+                    num_classes=3
+                ),
                 seg_logits,
-                batch_masks
+                batch_masks,
+                masks_b,
+                lam
+            )
+
+            seg_ce_loss = mix_loss(
+                segmentation_criterion,
+                seg_logits,
+                batch_masks,
+                masks_b,
+                lam
             )
 
             segmentation_loss = seg_ce_loss + seg_dice_loss
@@ -538,11 +819,30 @@ def main():
 
             # -----------------------------------------
             # Accuracy
+            #
+            # Under mixup neither label set is "the"
+            # target, so batch accuracy is the
+            # lambda-weighted agreement with both -
+            # the same convention as the loss. This is
+            # deliberately NOT comparable to the train
+            # accuracy of an un-mixed run.
             # -----------------------------------------
 
-            accuracy = (
+            correct_a = (
                 predictions == batch_labels
-            ).float().mean()
+            ).float().sum()
+
+            if lam >= 1.0:
+                batch_correct = correct_a
+            else:
+                batch_correct = (
+                    lam * correct_a
+                    + (1.0 - lam) * (
+                        predictions == labels_b
+                    ).float().sum()
+                )
+
+            accuracy = batch_correct / batch_images.size(0)
 
             # Accumulate epoch statistics
 
@@ -550,9 +850,7 @@ def main():
                 loss.item() * batch_images.size(0)
             )
 
-            train_correct += (
-                predictions == batch_labels
-            ).sum().item()
+            train_correct += batch_correct.item()
 
             train_samples += batch_images.size(0)
 
@@ -581,6 +879,12 @@ def main():
             writer.add_scalar(
                 "training/accuracy",
                 accuracy.item(),
+                global_step
+            )
+
+            writer.add_scalar(
+                "training/mixup_lambda",
+                lam,
                 global_step
             )
 
@@ -1048,6 +1352,18 @@ def main():
 
                 "optimizer_state_dict":
                     optimizer.state_dict(),
+
+                # Saved BEFORE scheduler.step() for this epoch, so
+                # last_epoch == epoch. The resume path accounts for
+                # that and advances the curve by one.
+                "scheduler_state_dict":
+                    scheduler.state_dict(),
+
+                "mixup_alpha":
+                    args.mixup_alpha,
+
+                "mixup_prob":
+                    args.mixup_prob,
 
                 "val_accuracy":
                     val_accuracy,
